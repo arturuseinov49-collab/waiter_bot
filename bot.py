@@ -25,7 +25,7 @@ dp = Dispatcher()
 
 QUESTIONS_FILE = "questions.xlsx"
 RESULTS_FILE = "results.xlsx"
-QUESTIONS_PER_TEST = 10
+QUESTIONS_PER_TEST = 15
 
 
 # =====================================================================
