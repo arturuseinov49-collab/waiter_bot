@@ -1,5 +1,6 @@
 import asyncio
 import os
+import json
 import random
 from datetime import datetime
 from collections import defaultdict
@@ -15,49 +16,94 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
 )
 
-# ---------- Настройки ----------
+# =====================================================================
+# НАСТРОЙКИ
+# =====================================================================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ваш Telegram ID, задаётся в .env
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-QUESTIONS_FILE = "questions.xlsx"
+# ---------------------------------------------------------------------
+# СПИСОК ПРОФЕССИЙ И ИХ ФАЙЛОВ С ВОПРОСАМИ.
+# Чтобы добавить новую профессию: положите файл вопросов рядом с bot.py
+# в том же формате (7 колонок) и добавьте одну строку сюда.
+# ---------------------------------------------------------------------
+ROLES = {
+    "waiter":    {"label": "🍽 Официант",  "file": "questions_waiter.xlsx"},
+    "pizzaiolo": {"label": "🍕 Пиццайоло", "file": "questions_pizzaiolo.xlsx"},
+    "cook":      {"label": "👨‍🍳 Повар",    "file": "questions_cook.xlsx"},
+}
+
+ROLES_FILE = "user_roles.json"
 RESULTS_FILE = "results.xlsx"
-QUESTIONS_PER_TEST = 15
+QUESTIONS_PER_TEST = 10
 
 
 # =====================================================================
-# ЗАГРУЗКА ВОПРОСОВ
+# ЗАГРУЗКА ВОПРОСОВ (отдельно на каждую профессию, с кэшем)
 # =====================================================================
-def load_questions():
-    wb = openpyxl.load_workbook(QUESTIONS_FILE)
-    ws = wb.active
+_questions_cache = {}
+
+
+def load_questions_for_role(role_key):
+    if role_key in _questions_cache:
+        return _questions_cache[role_key]
+
+    path = ROLES[role_key]["file"]
     questions = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        category, question, opt1, opt2, opt3, opt4, correct = row
-        if not question:
-            continue
-        questions.append({
-            "category": category,
-            "question": question,
-            "options": [opt1, opt2, opt3, opt4],
-            "correct": int(correct),
-        })
+    if os.path.exists(path):
+        wb = openpyxl.load_workbook(path)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            category, question, opt1, opt2, opt3, opt4, correct = row
+            if not question:
+                continue
+            questions.append({
+                "category": category,
+                "question": question,
+                "options": [opt1, opt2, opt3, opt4],
+                "correct": int(correct),
+            })
+    _questions_cache[role_key] = questions
     return questions
 
 
-ALL_QUESTIONS = load_questions()
-CATEGORIES = sorted(set(q["category"] for q in ALL_QUESTIONS))
+def categories_for_role(role_key):
+    return sorted(set(q["category"] for q in load_questions_for_role(role_key)))
 
-user_sessions = {}
+
+user_sessions = {}  # активные прохождения теста
 
 
 # =====================================================================
-# РАБОТА С ФАЙЛОМ РЕЗУЛЬТАТОВ
+# ХРАНЕНИЕ ВЫБРАННОЙ ПРОФЕССИИ (простой json-файл user_id -> role_key)
 # =====================================================================
-RESULTS_HEADERS = ["Дата и время", "User ID", "Имя", "Username", "Раздел", "Правильных", "Всего", "Процент"]
+def load_user_roles():
+    if os.path.exists(ROLES_FILE):
+        with open(ROLES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_user_role(user_id, role_key):
+    roles = load_user_roles()
+    roles[str(user_id)] = role_key
+    with open(ROLES_FILE, "w", encoding="utf-8") as f:
+        json.dump(roles, f, ensure_ascii=False, indent=2)
+
+
+def get_user_role(user_id):
+    roles = load_user_roles()
+    return roles.get(str(user_id))
+
+
+# =====================================================================
+# РЕЗУЛЬТАТЫ
+# =====================================================================
+RESULTS_HEADERS = ["Дата и время", "User ID", "Имя", "Username", "Профессия", "Раздел", "Правильных", "Всего", "Процент"]
 
 
 def ensure_results_file():
@@ -68,16 +114,18 @@ def ensure_results_file():
         wb.save(RESULTS_FILE)
 
 
-def save_result(user, category, score, total):
+def save_result(user, role_key, category, score, total):
     ensure_results_file()
     wb = openpyxl.load_workbook(RESULTS_FILE)
     ws = wb.active
     percent = round(score / total * 100)
+    role_label = ROLES.get(role_key, {}).get("label", role_key)
     ws.append([
         datetime.now().strftime("%d.%m.%Y %H:%M"),
         user.id,
         user.full_name,
         f"@{user.username}" if user.username else "-",
+        role_label,
         category,
         score,
         total,
@@ -90,25 +138,32 @@ def read_all_results():
     ensure_results_file()
     wb = openpyxl.load_workbook(RESULTS_FILE)
     ws = wb.active
-    rows = list(ws.iter_rows(min_row=2, values_only=True))
-    return rows
+    return list(ws.iter_rows(min_row=2, values_only=True))
+    # (дата, user_id, имя, username, профессия, раздел, правильных, всего, процент)
 
 
 # =====================================================================
 # КЛАВИАТУРЫ
 # =====================================================================
-def main_menu_keyboard(is_admin: bool):
+def role_selection_keyboard():
+    buttons = [[InlineKeyboardButton(text=r["label"], callback_data=f"set_role:{key}")] for key, r in ROLES.items()]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def main_menu_keyboard(is_admin_user: bool):
     buttons = [
         [InlineKeyboardButton(text="📝 Пройти тест", callback_data="menu:test")],
         [InlineKeyboardButton(text="📊 Мои результаты", callback_data="menu:my_results")],
+        [InlineKeyboardButton(text="🔁 Сменить профессию", callback_data="menu:change_role")],
     ]
-    if is_admin:
+    if is_admin_user:
         buttons.append([InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def categories_keyboard():
-    buttons = [[InlineKeyboardButton(text=cat, callback_data=f"start_test:{cat}")] for cat in CATEGORIES]
+def categories_keyboard(role_key):
+    cats = categories_for_role(role_key)
+    buttons = [[InlineKeyboardButton(text=cat, callback_data=f"start_test:{cat}")] for cat in cats]
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -130,7 +185,6 @@ def admin_menu_keyboard():
 
 
 def persistent_keyboard(is_admin_user: bool):
-    """Кнопки, которые всегда видны внизу экрана, не нужно листать чат"""
     buttons = [
         [KeyboardButton(text="📝 Пройти тест"), KeyboardButton(text="📊 Мои результаты")],
     ]
@@ -139,16 +193,23 @@ def persistent_keyboard(is_admin_user: bool):
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
 
+def is_admin(user_id):
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
 # =====================================================================
-# ГЛАВНОЕ МЕНЮ
+# ГЛАВНОЕ МЕНЮ / ВЫБОР ПРОФЕССИИ
 # =====================================================================
 async def show_main_menu(chat_id, message_id=None, user_id=None):
-    is_admin = (user_id == ADMIN_ID)
+    is_adm = is_admin(user_id)
+    role_key = get_user_role(user_id)
+    role_label = ROLES.get(role_key, {}).get("label", "не выбрана")
     text = (
-        "👋 Привет! Я бот для тестирования официантов по меню и алкоголю.\n\n"
+        "👋 Привет! Я бот для тестирования персонала по меню и алкоголю.\n\n"
+        f"Твоя профессия: {role_label}\n\n"
         "Выбери, что хочешь сделать:"
     )
-    kb = main_menu_keyboard(is_admin)
+    kb = main_menu_keyboard(is_adm)
     if message_id:
         await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
     else:
@@ -157,42 +218,29 @@ async def show_main_menu(chat_id, message_id=None, user_id=None):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    is_adm = (message.from_user.id == ADMIN_ID)
+    role_key = get_user_role(message.from_user.id)
+    is_adm = is_admin(message.from_user.id)
     await message.answer("Меню открыто снизу 👇", reply_markup=persistent_keyboard(is_adm))
-    await show_main_menu(message.chat.id, user_id=message.from_user.id)
 
-
-@dp.message(F.text == "📝 Пройти тест")
-async def kb_test(message: types.Message):
-    await message.answer("Выбери раздел для теста:", reply_markup=categories_keyboard())
-
-
-@dp.message(F.text == "📊 Мои результаты")
-async def kb_my_results(message: types.Message):
-    all_results = read_all_results()
-    my_results = [r for r in all_results if r[1] == message.from_user.id]
-    if not my_results:
-        text = "У тебя пока нет пройденных тестов.\nНажми «Пройти тест», чтобы начать!"
+    if not role_key:
+        await message.answer("Сначала укажи, кто ты:", reply_markup=role_selection_keyboard())
     else:
-        my_results = my_results[-10:]
-        lines = ["📊 Твои последние результаты:\n"]
-        for r in reversed(my_results):
-            date, _, _, _, category, score, total, percent = r
-            lines.append(f"{date} — {category}: {score}/{total} ({percent}%)")
-        text = "\n".join(lines)
-    await message.answer(text)
+        await show_main_menu(message.chat.id, user_id=message.from_user.id)
 
 
-@dp.message(F.text == "⚙️ Админ-панель")
-async def kb_admin(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("⚙️ Админ-панель", reply_markup=admin_menu_keyboard())
+@dp.callback_query(F.data.startswith("set_role:"))
+async def set_role(callback: types.CallbackQuery):
+    role_key = callback.data.split(":", 1)[1]
+    save_user_role(callback.from_user.id, role_key)
+    await callback.message.edit_text(f"Профессия сохранена: {ROLES[role_key]['label']}")
+    await show_main_menu(callback.message.chat.id, user_id=callback.from_user.id)
+    await callback.answer()
 
 
-@dp.message(Command("test"))
-async def test_command(message: types.Message):
-    await message.answer("Выбери раздел для теста:", reply_markup=categories_keyboard())
+@dp.callback_query(F.data == "menu:change_role")
+async def change_role(callback: types.CallbackQuery):
+    await callback.message.edit_text("Кто ты?", reply_markup=role_selection_keyboard())
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "menu:home")
@@ -203,30 +251,71 @@ async def menu_home(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "menu:test")
 async def menu_test(callback: types.CallbackQuery):
-    await callback.message.edit_text("Выбери раздел для теста:", reply_markup=categories_keyboard())
+    role_key = get_user_role(callback.from_user.id)
+    if not role_key:
+        await callback.message.edit_text("Сначала укажи, кто ты:", reply_markup=role_selection_keyboard())
+        await callback.answer()
+        return
+    await callback.message.edit_text("Выбери раздел для теста:", reply_markup=categories_keyboard(role_key))
     await callback.answer()
 
 
+# ---------- кнопки постоянного меню внизу экрана ----------
+@dp.message(F.text == "📝 Пройти тест")
+async def kb_test(message: types.Message):
+    role_key = get_user_role(message.from_user.id)
+    if not role_key:
+        await message.answer("Сначала укажи, кто ты:", reply_markup=role_selection_keyboard())
+        return
+    await message.answer("Выбери раздел для теста:", reply_markup=categories_keyboard(role_key))
+
+
+@dp.message(F.text == "📊 Мои результаты")
+async def kb_my_results(message: types.Message):
+    await send_my_results(message.chat.id, message.from_user.id)
+
+
+@dp.message(F.text == "⚙️ Админ-панель")
+async def kb_admin(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("⚙️ Админ-панель", reply_markup=admin_menu_keyboard())
+
+
+@dp.message(Command("test"))
+async def test_command(message: types.Message):
+    role_key = get_user_role(message.from_user.id)
+    if not role_key:
+        await message.answer("Сначала укажи, кто ты:", reply_markup=role_selection_keyboard())
+        return
+    await message.answer("Выбери раздел для теста:", reply_markup=categories_keyboard(role_key))
+
+
 # =====================================================================
-# МОИ РЕЗУЛЬТАТЫ (для официанта)
+# МОИ РЕЗУЛЬТАТЫ
 # =====================================================================
-@dp.callback_query(F.data == "menu:my_results")
-async def menu_my_results(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
+async def send_my_results(chat_id, user_id, message_id=None):
     all_results = read_all_results()
-    my_results = [r for r in all_results if r[1] == user_id]
+    my_results = [r for r in all_results if r[1] == user_id][-10:]
 
     if not my_results:
         text = "У тебя пока нет пройденных тестов.\nНажми «Пройти тест», чтобы начать!"
     else:
-        my_results = my_results[-10:]
         lines = ["📊 Твои последние результаты:\n"]
         for r in reversed(my_results):
-            date, _, _, _, category, score, total, percent = r
-            lines.append(f"{date} — {category}: {score}/{total} ({percent}%)")
+            date, _, _, _, role_label, category, score, total, percent = r
+            lines.append(f"{date} — {role_label} / {category}: {score}/{total} ({percent}%)")
         text = "\n".join(lines)
 
-    await callback.message.edit_text(text, reply_markup=back_to_menu_keyboard())
+    if message_id:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=back_to_menu_keyboard())
+    else:
+        await bot.send_message(chat_id, text)
+
+
+@dp.callback_query(F.data == "menu:my_results")
+async def menu_my_results(callback: types.CallbackQuery):
+    await send_my_results(callback.message.chat.id, callback.from_user.id, message_id=callback.message.message_id)
     await callback.answer()
 
 
@@ -236,15 +325,22 @@ async def menu_my_results(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("start_test:"))
 async def start_test(callback: types.CallbackQuery):
     category = callback.data.split(":", 1)[1]
-    pool = [q for q in ALL_QUESTIONS if q["category"] == category]
+    role_key = get_user_role(callback.from_user.id)
+    all_questions = load_questions_for_role(role_key)
+    pool = [q for q in all_questions if q["category"] == category]
     random.shuffle(pool)
     selected = pool[:QUESTIONS_PER_TEST]
+
+    if not selected:
+        await callback.answer("В этом разделе пока нет вопросов.", show_alert=True)
+        return
 
     user_sessions[callback.from_user.id] = {
         "questions": selected,
         "index": 0,
         "score": 0,
         "category": category,
+        "role_key": role_key,
         "chat_id": callback.message.chat.id,
         "message_id": callback.message.message_id,
     }
@@ -298,6 +394,7 @@ async def answer_handler(callback: types.CallbackQuery):
         score = session["score"]
         total = len(session["questions"])
         category = session["category"]
+        role_key = session["role_key"]
         percent = round(score / total * 100)
 
         if percent >= 80:
@@ -317,17 +414,13 @@ async def answer_handler(callback: types.CallbackQuery):
             text, chat_id=session["chat_id"], message_id=session["message_id"],
             reply_markup=back_to_menu_keyboard()
         )
-        save_result(callback.from_user, category, score, total)
+        save_result(callback.from_user, role_key, category, score, total)
         del user_sessions[user_id]
 
 
 # =====================================================================
 # АДМИН-ПАНЕЛЬ
 # =====================================================================
-def is_admin(user_id):
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
-
-
 @dp.callback_query(F.data == "menu:admin")
 async def menu_admin(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -348,24 +441,23 @@ async def admin_stats(callback: types.CallbackQuery):
         text = "Пока нет ни одного пройденного теста."
     else:
         total_tests = len(results)
-        avg_percent = round(sum(r[7] for r in results) / total_tests)
-
-        by_category = defaultdict(list)
-        for r in results:
-            by_category[r[4]].append(r[7])
-
+        avg_percent = round(sum(r[8] for r in results) / total_tests)
         unique_users = len({r[1] for r in results})
+
+        by_role = defaultdict(list)
+        for r in results:
+            by_role[r[4]].append(r[8])
 
         lines = [
             "📈 Общая статистика\n",
             f"Всего пройдено тестов: {total_tests}",
-            f"Уникальных официантов: {unique_users}",
+            f"Уникальных сотрудников: {unique_users}",
             f"Средний результат: {avg_percent}%\n",
-            "По разделам:",
+            "По профессиям:",
         ]
-        for cat, percents in sorted(by_category.items()):
+        for role_label, percents in sorted(by_role.items()):
             avg = round(sum(percents) / len(percents))
-            lines.append(f"  {cat}: {avg}% (тестов: {len(percents)})")
+            lines.append(f"  {role_label}: {avg}% (тестов: {len(percents)})")
 
         text = "\n".join(lines)
 
@@ -380,16 +472,15 @@ async def admin_weak(callback: types.CallbackQuery):
         return
 
     results = read_all_results()
-    weak = [r for r in results if r[7] < 60]
-    weak = sorted(weak, key=lambda r: r[7])[:15]
+    weak = sorted([r for r in results if r[8] < 60], key=lambda r: r[8])[:15]
 
     if not weak:
         text = "Слабых результатов (ниже 60%) не найдено. 👍"
     else:
         lines = ["📉 Слабые результаты (ниже 60%):\n"]
         for r in weak:
-            date, _, name, username, category, score, total, percent = r
-            lines.append(f"{date} — {name} ({username}) — {category}: {score}/{total} ({percent}%)")
+            date, _, name, username, role_label, category, score, total, percent = r
+            lines.append(f"{date} — {name} ({username}) — {role_label} / {category}: {score}/{total} ({percent}%)")
         text = "\n".join(lines)
 
     await callback.message.edit_text(text, reply_markup=admin_menu_keyboard())
