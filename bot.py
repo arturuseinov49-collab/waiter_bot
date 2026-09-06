@@ -38,8 +38,10 @@ ROLES = {
 }
 
 ROLES_FILE = "user_roles.json"
+SETTINGS_FILE = "settings.json"
 RESULTS_FILE = "results.xlsx"
-QUESTIONS_PER_TEST = 10
+DEFAULT_QUESTIONS_PER_TEST = 10
+QUESTION_COUNT_OPTIONS = [5, 10, 15, 20, 25, 30]
 
 
 # =====================================================================
@@ -99,6 +101,28 @@ def save_user_role(user_id, role_key):
 def get_user_role(user_id):
     roles = load_user_roles()
     return roles.get(str(user_id))
+
+
+# =====================================================================
+# НАСТРОЙКИ: КОЛИЧЕСТВО ВОПРОСОВ НА ТЕСТ (отдельно на каждую профессию)
+# =====================================================================
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def get_questions_per_test(role_key):
+    settings = load_settings()
+    return settings.get(role_key, DEFAULT_QUESTIONS_PER_TEST)
+
+
+def save_questions_per_test(role_key, value):
+    settings = load_settings()
+    settings[role_key] = value
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
 
 
 # =====================================================================
@@ -179,9 +203,37 @@ def admin_menu_keyboard():
     buttons = [
         [InlineKeyboardButton(text="📈 Общая статистика", callback_data="admin:stats")],
         [InlineKeyboardButton(text="📉 Слабые результаты (<60%)", callback_data="admin:weak")],
+        [InlineKeyboardButton(text="🔢 Кол-во вопросов", callback_data="admin:qcount")],
         [InlineKeyboardButton(text="📥 Скачать файл результатов", callback_data="admin:download")],
         [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:home")],
     ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def qcount_roles_keyboard():
+    buttons = []
+    for key, r in ROLES.items():
+        current = get_questions_per_test(key)
+        current_label = "все" if current == "all" else str(current)
+        buttons.append([InlineKeyboardButton(
+            text=f'{r["label"]}: {current_label}', callback_data=f"qcount_role:{key}"
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def qcount_values_keyboard(role_key):
+    buttons = []
+    row = []
+    for val in QUESTION_COUNT_OPTIONS:
+        row.append(InlineKeyboardButton(text=str(val), callback_data=f"qcount_set:{role_key}:{val}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="Все вопросы раздела", callback_data=f"qcount_set:{role_key}:all")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:qcount")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -330,7 +382,8 @@ async def start_test(callback: types.CallbackQuery):
     all_questions = load_questions_for_role(role_key)
     pool = [q for q in all_questions if q["category"] == category]
     random.shuffle(pool)
-    selected = pool[:QUESTIONS_PER_TEST]
+    count = get_questions_per_test(role_key)
+    selected = pool if count == "all" else pool[:count]
 
     if not selected:
         await callback.answer("В этом разделе пока нет вопросов.", show_alert=True)
@@ -498,6 +551,47 @@ async def admin_download(callback: types.CallbackQuery):
     if os.path.exists(RESULTS_FILE):
         await bot.send_document(callback.message.chat.id, FSInputFile(RESULTS_FILE))
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin:qcount")
+async def admin_qcount(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администратора.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Выбери профессию, чтобы изменить количество вопросов в тесте:",
+        reply_markup=qcount_roles_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("qcount_role:"))
+async def qcount_role(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администратора.", show_alert=True)
+        return
+    role_key = callback.data.split(":", 1)[1]
+    label = ROLES[role_key]["label"]
+    await callback.message.edit_text(
+        f"Сколько вопросов задавать за один тест для «{label}»?",
+        reply_markup=qcount_values_keyboard(role_key)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("qcount_set:"))
+async def qcount_set(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для администратора.", show_alert=True)
+        return
+    _, role_key, value = callback.data.split(":", 2)
+    value_to_save = value if value == "all" else int(value)
+    save_questions_per_test(role_key, value_to_save)
+    await callback.answer("Сохранено!")
+    await callback.message.edit_text(
+        "Выбери профессию, чтобы изменить количество вопросов в тесте:",
+        reply_markup=qcount_roles_keyboard()
+    )
 
 
 # =====================================================================
