@@ -49,7 +49,7 @@ _questions_cache = {}
 
 
 def load_questions_for_role(role_key):
-    if role_key in _questions_cache:
+    if role_key in _questions_cache and _questions_cache[role_key]:
         return _questions_cache[role_key]
 
     path = ROLES[role_key]["file"]
@@ -67,7 +67,8 @@ def load_questions_for_role(role_key):
                 "options": [opt1, opt2, opt3, opt4],
                 "correct": int(correct),
             })
-    _questions_cache[role_key] = questions
+    if questions:
+        _questions_cache[role_key] = questions
     return questions
 
 
