@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import random
+import traceback
 from datetime import datetime
 from collections import defaultdict
 
@@ -13,7 +14,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ErrorEvent,
 )
 
 # =====================================================================
@@ -132,11 +133,20 @@ RESULTS_HEADERS = ["Дата и время", "User ID", "Имя", "Username", "�
 
 
 def ensure_results_file():
-    if not os.path.exists(RESULTS_FILE):
-        wb = Workbook()
+    if os.path.exists(RESULTS_FILE):
+        wb = openpyxl.load_workbook(RESULTS_FILE)
         ws = wb.active
-        ws.append(RESULTS_HEADERS)
-        wb.save(RESULTS_FILE)
+        header = [cell.value for cell in ws[1]]
+        if header == RESULTS_HEADERS:
+            return  # файл уже в правильном формате
+        # формат устарел (например, после обновления бота) - бэкапим и создаём заново
+        backup_name = f"results_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        os.rename(RESULTS_FILE, backup_name)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(RESULTS_HEADERS)
+    wb.save(RESULTS_FILE)
 
 
 def save_result(user, role_key, category, score, total):
@@ -595,9 +605,35 @@ async def qcount_set(callback: types.CallbackQuery):
 
 
 # =====================================================================
+# ОБРАБОТЧИК ОШИБОК - при любом сбое присылает вам в личку текст ошибки
+# =====================================================================
+@dp.errors()
+async def global_error_handler(event: ErrorEvent):
+    tb = "".join(traceback.format_exception(
+        type(event.exception), event.exception, event.exception.__traceback__
+    ))
+    tb_short = tb[-3500:]  # обрезаем, у Telegram лимит на длину сообщения
+    if ADMIN_ID:
+        try:
+            await bot.send_message(ADMIN_ID, f"⚠️ Ошибка в боте:\n\n{tb_short}")
+        except Exception:
+            pass
+    return True
+
+
+async def on_startup():
+    if ADMIN_ID:
+        try:
+            await bot.send_message(ADMIN_ID, "✅ Бот запущен и готов к работе.")
+        except Exception:
+            pass
+
+
+# =====================================================================
 # ЗАПУСК
 # =====================================================================
 async def main():
+    dp.startup.register(on_startup)
     await dp.start_polling(bot)
 
 
