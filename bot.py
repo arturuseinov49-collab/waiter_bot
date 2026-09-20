@@ -403,6 +403,8 @@ async def start_test(callback: types.CallbackQuery):
         "questions": selected,
         "index": 0,
         "score": 0,
+        "results": [],       # True/False по каждому отвеченному вопросу - для цвета квадратиков
+        "wrong_answers": [], # детали неверных ответов - для разбора в конце теста
         "category": category,
         "role_key": role_key,
         "chat_id": callback.message.chat.id,
@@ -422,7 +424,13 @@ async def send_question(user_id):
         buttons.append([InlineKeyboardButton(text=str(option), callback_data=f"answer:{i}")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    progress = "🟩" * index + "⬜️" * (len(session["questions"]) - index)
+    squares = []
+    for i in range(len(session["questions"])):
+        if i < len(session["results"]):
+            squares.append("🟩" if session["results"][i] else "🟥")
+        else:
+            squares.append("⬜️")
+    progress = "".join(squares)
     text = f"{progress}\nВопрос {index + 1} из {len(session['questions'])}:\n\n{question['question']}"
 
     await bot.edit_message_text(
@@ -440,13 +448,22 @@ async def answer_handler(callback: types.CallbackQuery):
     session = user_sessions[user_id]
     chosen = int(callback.data.split(":", 1)[1])
     question = session["questions"][session["index"]]
+    chosen_option = question["options"][chosen - 1]
+    correct_option = question["options"][question["correct"] - 1]
+    is_correct = chosen == question["correct"]
 
-    if chosen == question["correct"]:
+    session["results"].append(is_correct)
+
+    if is_correct:
         session["score"] += 1
         result_text = "✅ Верно!"
     else:
-        correct_option = question["options"][question["correct"] - 1]
         result_text = f"❌ Неверно. Правильный ответ: {correct_option}"
+        session["wrong_answers"].append({
+            "question": question["question"],
+            "chosen": chosen_option,
+            "correct": correct_option,
+        })
 
     await callback.answer(result_text, show_alert=False)
 
@@ -468,7 +485,9 @@ async def answer_handler(callback: types.CallbackQuery):
         else:
             comment = "Стоит повторить материал 📖"
 
+        squares = "".join("🟩" if r else "🟥" for r in session["results"])
         text = (
+            f"{squares}\n\n"
             f"Тест завершён!\n\n"
             f"Раздел: {category}\n"
             f"Правильных ответов: {score} из {total} ({percent}%)\n\n"
@@ -479,6 +498,29 @@ async def answer_handler(callback: types.CallbackQuery):
             reply_markup=back_to_menu_keyboard()
         )
         save_result(callback.from_user, role_key, category, score, total)
+
+        # ---------- разбор неверных ответов отдельным сообщением ----------
+        wrong = session["wrong_answers"]
+        if wrong:
+            lines = ["📋 Разбор ошибок:\n"]
+            for w in wrong:
+                lines.append(
+                    f"❓ {w['question']}\n"
+                    f"   Твой ответ: {w['chosen']}\n"
+                    f"   Правильный: {w['correct']}\n"
+                )
+            full_text = "\n".join(lines)
+
+            # Telegram не пропустит сообщение длиннее ~4096 символов - режем на части
+            chunk = ""
+            for line_block in full_text.split("\n\n"):
+                if len(chunk) + len(line_block) + 2 > 3500:
+                    await bot.send_message(session["chat_id"], chunk)
+                    chunk = ""
+                chunk += line_block + "\n\n"
+            if chunk.strip():
+                await bot.send_message(session["chat_id"], chunk)
+
         del user_sessions[user_id]
 
 
