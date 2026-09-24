@@ -3,3 +3,12 @@ venv/
 __pycache__/
 *.pyc
 results.xlsx
+data/
+*.sqlite3*
+user_roles.json
+settings.json
+results_backup_*.xlsx
+backups/
+.idea/
+.pytest_cache/
+dist/

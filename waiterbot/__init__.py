@@ -1,0 +1,1 @@
+"""Restaurant staff training bot."""
