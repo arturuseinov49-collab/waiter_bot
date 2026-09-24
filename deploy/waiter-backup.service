@@ -1,0 +1,8 @@
+[Unit]
+Description=Waiter bot database backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/waiter_bot
+ExecStart=/root/waiter_bot/venv/bin/python manage.py backup
+UMask=0077
